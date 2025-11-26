@@ -3,33 +3,46 @@
 import { useEffect } from "react";
 import { useSearchParams } from "next/navigation";
 
-export type StudioMode = "image" | "video" | "remix";
+type Mode = "image" | "video";
 
-export function useStudioQueryPrefill(opts: {
-  setMode?: (m: StudioMode) => void;
-  setPrompt?: (p: string) => void;
-  setSelectedCharacterId?: (id: string) => void;
-  setAspect?: (a: string) => void;
-  setSeed?: (n: number) => void;
-}) {
+type Args = {
+  setMode: (m: Mode) => void;
+  setPrompt: (p: string) => void;
+  setSelectedCharacterId: (id: string) => void;
+  setAspect: (a: string) => void;
+  setSeed: (n: number) => void;
+};
+
+export function useStudioQueryPrefill({
+  setMode,
+  setPrompt,
+  setSelectedCharacterId,
+  setAspect,
+  setSeed,
+}: Args) {
   const sp = useSearchParams();
 
   useEffect(() => {
-    const mode = (sp.get("mode") as StudioMode | null) ?? null;
-    const character = sp.get("character");
-    const prompt = sp.get("prompt");
-    const aspect = sp.get("aspect");
-    const seedRaw = sp.get("seed");
+    if (!sp) return;
 
-    if (mode && opts.setMode) opts.setMode(mode);
-    if (character && opts.setSelectedCharacterId) opts.setSelectedCharacterId(character);
-    if (prompt && opts.setPrompt) opts.setPrompt(decodeURIComponent(prompt));
-    if (aspect && opts.setAspect) opts.setAspect(aspect);
-    if (seedRaw && opts.setSeed) {
+    const mode = sp.get("mode");
+    if (mode === "image" || mode === "video") setMode(mode);
+
+    const prompt = sp.get("prompt");
+    if (typeof prompt === "string" && prompt.length > 0) setPrompt(prompt);
+
+    const character = sp.get("character");
+    if (typeof character === "string" && character.length > 0) setSelectedCharacterId(character);
+
+    const aspect = sp.get("aspect");
+    if (typeof aspect === "string" && aspect.length > 0) setAspect(aspect);
+
+    const seedRaw = sp.get("seed");
+    if (seedRaw) {
       const n = Number(seedRaw);
-      if (!Number.isNaN(n)) opts.setSeed(n);
+      if (!Number.isNaN(n)) setSeed(n);
     }
-    // only run when query changes
+    // we only want this on initial mount / param change
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sp]);
 }
