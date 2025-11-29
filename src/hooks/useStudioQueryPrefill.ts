@@ -5,44 +5,30 @@ import { useSearchParams } from "next/navigation";
 
 type Mode = "image" | "video";
 
-type Args = {
+export function useStudioQueryPrefill(opts: {
   setMode: (m: Mode) => void;
   setPrompt: (p: string) => void;
   setSelectedCharacterId: (id: string) => void;
   setAspect: (a: string) => void;
   setSeed: (n: number) => void;
-};
-
-export function useStudioQueryPrefill({
-  setMode,
-  setPrompt,
-  setSelectedCharacterId,
-  setAspect,
-  setSeed,
-}: Args) {
+}) {
   const sp = useSearchParams();
 
   useEffect(() => {
-    if (!sp) return;
-
-    const mode = sp.get("mode");
-    if (mode === "image" || mode === "video") setMode(mode);
+    const mode = (sp.get("mode") || "").toLowerCase();
+    if (mode === "image" || mode === "video") opts.setMode(mode);
 
     const prompt = sp.get("prompt");
-    if (typeof prompt === "string" && prompt.length > 0) setPrompt(prompt);
+    if (prompt) opts.setPrompt(prompt);
 
     const character = sp.get("character");
-    if (typeof character === "string" && character.length > 0) setSelectedCharacterId(character);
+    if (character) opts.setSelectedCharacterId(character);
 
     const aspect = sp.get("aspect");
-    if (typeof aspect === "string" && aspect.length > 0) setAspect(aspect);
+    if (aspect) opts.setAspect(aspect);
 
-    const seedRaw = sp.get("seed");
-    if (seedRaw) {
-      const n = Number(seedRaw);
-      if (!Number.isNaN(n)) setSeed(n);
-    }
-    // we only want this on initial mount / param change
+    const seed = sp.get("seed");
+    if (seed && !Number.isNaN(Number(seed))) opts.setSeed(Number(seed));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sp]);
+  }, []);
 }

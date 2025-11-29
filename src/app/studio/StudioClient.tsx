@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useStudioQueryPrefill } from "@/hooks/useStudioQueryPrefill";
 
-type Mode = "image" | "video";
+type Mode = "image" | "video" | "remix";
 
 type GenResult = {
   id: string;
@@ -42,22 +42,11 @@ export default function StudioClient() {
   useEffect(() => {
     try {
       const li = localStorage.getItem("nb_logged_in") === "true";
-      // IMPORTANT: for now, treat login as access so you can build backend without getting blocked
-      // Later you can swap this to a real plan check (trial/studio flags).
-      const saRaw = localStorage.getItem("nb_studio_access") === "true";
+      const sa = localStorage.getItem("nb_studio_access") === "true";
       setIsLoggedIn(li);
-      setHasStudioAccess(li || saRaw);
+      setHasStudioAccess(li && sa);
     } catch {}
   }, []);
-
-  function doLogout() {
-    try {
-      localStorage.removeItem("nb_logged_in");
-      localStorage.removeItem("nb_studio_access");
-    } catch {}
-    setIsLoggedIn(false);
-    setHasStudioAccess(false);
-  }
 
   // ---- studio state
   const [mode, setMode] = useState<Mode>("image");
@@ -66,20 +55,23 @@ export default function StudioClient() {
   const [aspect, setAspect] = useState<string>("4:5");
   const [seed, setSeed] = useState<number>(20251201);
 
-  const [steps, setSteps] = useState<number>(30);
+  const [steps, setSteps] = useState<number>(16);
   const [guidance, setGuidance] = useState<number>(7.5);
 
-  // Video placeholders (UI only)
-  const [videoDuration, setVideoDuration] = useState<number>(6);
-  const [videoModel, setVideoModel] = useState<string>("Studio Video v1 (coming soon)");
+  // Remix-only controls
+  const [baseImage, setBaseImage] = useState<File | null>(null);
+  const [strength, setStrength] = useState<number>(0.65);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [results, setResults] = useState<GenResult[]>([]);
   const [active, setActive] = useState<GenResult | null>(null);
 
-  const canGenerate = prompt.trim().length > 0 && !isGenerating;
+  const canGenerate =
+    prompt.trim().length > 0 &&
+    !isGenerating &&
+    (mode !== "remix" || !!baseImage);
 
-  // ---- Prefill from URL query
+  // ---- Prefill from URL query (uses useSearchParams internally)
   useStudioQueryPrefill({
     setMode: (m) => setMode(m),
     setPrompt: (p) => setPrompt(p),
@@ -123,27 +115,185 @@ export default function StudioClient() {
   async function onGenerate() {
     if (!canGenerate) return;
 
-    if (mode === "video") {
-      const info: GenResult = {
-        id: `info_${Date.now()}`,
-        mode,
-        prompt,
-        character: selectedCharacterId,
-        aspect,
-        seed,
-        error: "Video generation is coming soon. (UI is ready — backend endpoint will be wired next.)",
-        createdAt: new Date().toISOString(),
-      };
-      setResults((prev) => [info, ...prev]);
-      setActive(info);
-      return;
-    }
-
-    // image
     setIsGenerating(true);
     try {
       const { width, height } = aspectToSize(aspect);
 
+      // ---- VIDEO (still backend dependent)
+      if (mode === "video") {
+        const r = await fetch("/api/generate-video", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt,
+            num_inference_steps: steps,
+            guidance_scale: guidance,
+            seed,
+          }),
+        });
+
+        const ct = r.headers.get("content-type") || "";
+
+        if (!r.ok && ct.includes("application/json")) {
+          const data = await r.json().catch(() => ({}));
+          const errMsg = data?.error || data?.message || `Generate failed (${r.status})`;
+          const fail: GenResult = {
+            id: `err_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            error: errMsg,
+            createdAt: new Date().toISOString(),
+          };
+          setResults((prev) => [fail, ...prev]);
+          setActive(fail);
+          return;
+        }
+
+        if (!r.ok) {
+          const fail: GenResult = {
+            id: `err_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            error: `Generate failed (${r.status})`,
+            createdAt: new Date().toISOString(),
+          };
+          setResults((prev) => [fail, ...prev]);
+          setActive(fail);
+          return;
+        }
+
+        if (ct.startsWith("video/") || ct.includes("octet-stream")) {
+          const bytes = await r.arrayBuffer();
+          const blob = new Blob([bytes], { type: ct.startsWith("video/") ? ct : "video/mp4" });
+          const url = URL.createObjectURL(blob);
+
+          const ok: GenResult = {
+            id: `gen_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            url,
+            createdAt: new Date().toISOString(),
+          };
+
+          setResults((prev) => [ok, ...prev]);
+          setActive(ok);
+          return;
+        }
+
+        const text = await r.text().catch(() => "");
+        const fail: GenResult = {
+          id: `err_${Date.now()}`,
+          mode,
+          prompt,
+          character: selectedCharacterId,
+          aspect,
+          seed,
+          error: `Unexpected response (${ct || "no content-type"}): ${text.slice(0, 160)}`,
+          createdAt: new Date().toISOString(),
+        };
+        setResults((prev) => [fail, ...prev]);
+        setActive(fail);
+        return;
+      }
+
+      // ---- REMIX (image-to-image)
+      if (mode === "remix") {
+        if (!baseImage) return;
+
+        const fd = new FormData();
+        fd.set("prompt", prompt);
+        fd.set("strength", String(strength));
+        fd.set("width", String(width));
+        fd.set("height", String(height));
+        fd.set("num_inference_steps", String(steps));
+        fd.set("guidance_scale", String(guidance));
+        fd.set("seed", String(seed));
+        fd.set("image", baseImage);
+
+        const r = await fetch("/api/remix", { method: "POST", body: fd });
+        const ct = r.headers.get("content-type") || "";
+
+        if (!r.ok && ct.includes("application/json")) {
+          const data = await r.json().catch(() => ({}));
+          const errMsg = data?.error || data?.message || `Remix failed (${r.status})`;
+          const fail: GenResult = {
+            id: `err_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            error: errMsg,
+            createdAt: new Date().toISOString(),
+          };
+          setResults((prev) => [fail, ...prev]);
+          setActive(fail);
+          return;
+        }
+
+        if (!r.ok) {
+          const fail: GenResult = {
+            id: `err_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            error: `Remix failed (${r.status})`,
+            createdAt: new Date().toISOString(),
+          };
+          setResults((prev) => [fail, ...prev]);
+          setActive(fail);
+          return;
+        }
+
+        if (ct.startsWith("image/") || ct.includes("octet-stream")) {
+          const bytes = await r.arrayBuffer();
+          const blob = new Blob([bytes], { type: ct.startsWith("image/") ? ct : "image/png" });
+          const url = URL.createObjectURL(blob);
+
+          const ok: GenResult = {
+            id: `gen_${Date.now()}`,
+            mode,
+            prompt,
+            character: selectedCharacterId,
+            aspect,
+            seed,
+            url,
+            createdAt: new Date().toISOString(),
+          };
+
+          setResults((prev) => [ok, ...prev]);
+          setActive(ok);
+          return;
+        }
+
+        const text = await r.text().catch(() => "");
+        const fail: GenResult = {
+          id: `err_${Date.now()}`,
+          mode,
+          prompt,
+          character: selectedCharacterId,
+          aspect,
+          seed,
+          error: `Unexpected response (${ct || "no content-type"}): ${text.slice(0, 160)}`,
+          createdAt: new Date().toISOString(),
+        };
+        setResults((prev) => [fail, ...prev]);
+        setActive(fail);
+        return;
+      }
+
+      // ---- IMAGE (text-to-image)
       const r = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -222,7 +372,7 @@ export default function StudioClient() {
         character: selectedCharacterId,
         aspect,
         seed,
-        error: `Unexpected response (${ct || "no content-type"}): ${text.slice(0, 120)}`,
+        error: `Unexpected response (${ct || "no content-type"}): ${text.slice(0, 160)}`,
         createdAt: new Date().toISOString(),
       };
       setResults((prev) => [fail, ...prev]);
@@ -245,11 +395,6 @@ export default function StudioClient() {
     }
   }
 
-  const primaryBtn =
-    "inline-flex h-11 items-center justify-center rounded-full bg-gradient-to-r from-[#ff3bff] to-[#c56bfb] px-6 text-sm font-semibold text-white shadow-[0_0_30px_rgba(255,59,255,0.22)] hover:brightness-110 disabled:opacity-60";
-  const outlineBtn =
-    "inline-flex h-11 items-center justify-center rounded-full border border-[#c56bfb]/50 bg-white/5 px-6 text-sm font-semibold text-[#F4ECFF] hover:bg-white/10";
-
   return (
     <main className="relative mx-auto w-full max-w-6xl px-4 py-10">
       {!isLoggedIn || !hasStudioAccess ? (
@@ -262,10 +407,16 @@ export default function StudioClient() {
           </p>
 
           <div className="mt-7 flex flex-col gap-3 sm:flex-row sm:justify-center">
-            <Link href="/pricing" className={outlineBtn}>
+            <Link
+              href="/pricing"
+              className="inline-flex h-11 items-center justify-center rounded-full border border-[#c56bfb]/50 bg-white/5 px-6 text-sm font-semibold text-[#F4ECFF] hover:bg-white/10"
+            >
               View Pricing
             </Link>
-            <Link href="/login?next=/studio" className={primaryBtn}>
+            <Link
+              href="/login?next=/studio"
+              className="inline-flex h-11 items-center justify-center rounded-full bg-gradient-to-r from-[#ff3bff] to-[#c56bfb] px-6 text-sm font-semibold text-white shadow-[0_0_30px_rgba(255,59,255,0.22)] hover:brightness-110"
+            >
               Login / Create account
             </Link>
           </div>
@@ -276,156 +427,145 @@ export default function StudioClient() {
         </section>
       ) : (
         <section className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-          {/* Left: prompt + preview */}
-          <div className="rounded-3xl border border-[#c56bfb]/30 bg-gradient-to-b from-[#0A0013] to-[#120021] p-6 shadow-[0_0_55px_rgba(255,59,255,0.08)]">
-            <div className="flex items-center justify-between gap-3">
-              <h1 className="text-2xl font-semibold tracking-tight text-[#F4ECFF] md:text-3xl">
-                NaughtyBotty Studio
-              </h1>
+          {/* LEFT */}
+          <div className="rounded-3xl border border-[#c56bfb]/35 bg-white/5 p-6 shadow-[0_0_70px_rgba(255,59,255,0.08)]">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h1 className="text-3xl font-semibold tracking-tight text-[#F4ECFF]">
+                  NaughtyBotty Studio
+                </h1>
+                <div className="mt-1 text-sm text-[#C4B3D9]">
+                  Synthetic-only. No real-person deepfakes.
+                </div>
+              </div>
 
-              <button onClick={doLogout} className={outlineBtn} type="button">
-                Logout
-              </button>
-            </div>
-
-            {/* Mode tabs */}
-            <div className="mt-5 flex w-full items-center gap-2 rounded-full border border-[#c56bfb]/25 bg-white/5 p-1">
-              {(["image", "video"] as const).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setMode(m)}
-                  className={clsx(
-                    "h-10 flex-1 rounded-full text-sm font-semibold transition",
-                    mode === m
-                      ? "bg-gradient-to-r from-[#ff3bff] to-[#c56bfb] text-white shadow-[0_0_25px_rgba(255,59,255,0.18)]"
-                      : "text-[#C4B3D9] hover:text-[#F4ECFF]"
-                  )}
-                >
-                  {m === "image" ? "Image" : "Video"}
-                </button>
-              ))}
-            </div>
-
-            <div className="mt-5">
-              <label className="text-xs font-semibold text-[#C4B3D9]">Prompt</label>
-              <textarea
-                className="mt-2 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 p-4 text-sm text-[#F4ECFF] outline-none placeholder:text-[#C4B3D9]/60 focus:border-[#ff3bff]/55"
-                placeholder={mode === "video" ? "Describe your video scene..." : "Describe your image scene..."}
-                rows={5}
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-              />
-              <div className="mt-2 text-xs text-[#C4B3D9]">
-                Synthetic-only. No real-person deepfakes.
+              <div className="flex gap-2">
+                {(["image", "video", "remix"] as Mode[]).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setMode(m)}
+                    className={clsx(
+                      "h-9 rounded-full px-4 text-sm font-semibold transition",
+                      mode === m
+                        ? "bg-gradient-to-r from-[#ff3bff] to-[#c56bfb] text-white shadow-[0_0_22px_rgba(255,59,255,0.18)]"
+                        : "border border-[#c56bfb]/45 bg-white/5 text-[#F4ECFF] hover:bg-white/10"
+                    )}
+                  >
+                    {m === "image" ? "Image" : m === "video" ? "Video" : "Remix"}
+                  </button>
+                ))}
               </div>
             </div>
 
-            {/* Video options (placeholder UI) */}
-            {mode === "video" && (
-              <div className="mt-5 grid gap-4 rounded-2xl border border-[#c56bfb]/20 bg-white/5 p-4">
-                <div className="grid gap-2">
-                  <label className="text-xs font-semibold text-[#C4B3D9]">Duration</label>
-                  <select
-                    className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                    value={videoDuration}
-                    onChange={(e) => setVideoDuration(Number(e.target.value))}
-                  >
-                    <option value={4}>4s</option>
-                    <option value={6}>6s</option>
-                    <option value={8}>8s</option>
-                  </select>
+            {/* Prompt */}
+            <div className="mt-6">
+              <label className="text-xs font-semibold tracking-wide text-[#C4B3D9]">
+                Prompt
+              </label>
+              <textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder={
+                  mode === "remix"
+                    ? "Describe what to change/keep. e.g. NOVA-core, neon bokeh, chrome accents…"
+                    : "Describe the scene…"
+                }
+                className="mt-2 h-32 w-full resize-none rounded-2xl border border-[#c56bfb]/30 bg-black/20 p-4 text-sm text-[#F4ECFF] outline-none placeholder:text-[#C4B3D9]/60 focus:border-[#ff3bff]/60"
+              />
+            </div>
+
+            {/* Remix uploader */}
+            {mode === "remix" && (
+              <div className="mt-5 rounded-2xl border border-[#c56bfb]/25 bg-black/10 p-4">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-[#F4ECFF]">Base image (PNG/JPG)</div>
+                    <div className="text-xs text-[#C4B3D9]">
+                      Upload an existing Nova image to keep face/identity consistent.
+                    </div>
+                  </div>
+
+                  <input
+                    type="file" data-remix-file="true"
+                    accept="image/*"
+                    onChange={(e) => setBaseImage(e.target.files?.[0] ?? null)}
+                    className="w-full text-sm text-[#C4B3D9] file:mr-3 file:rounded-full file:border-0 file:bg-white/10 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-[#F4ECFF] hover:file:bg-white/15 sm:w-auto"
+                  />
                 </div>
 
-                <div className="grid gap-2">
-                  <label className="text-xs font-semibold text-[#C4B3D9]">Model</label>
-                  <select
-                    className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                    value={videoModel}
-                    onChange={(e) => setVideoModel(e.target.value)}
-                  >
-                    <option>Studio Video v1 (coming soon)</option>
-                  </select>
-                </div>
-
-                <div className="text-xs text-[#C4B3D9]">
-                  Video generation is being wired next. This panel is ready.
+                <div className="mt-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs font-semibold text-[#C4B3D9]">Strength</div>
+                    <div className="text-xs text-[#C4B3D9]">{strength.toFixed(2)}</div>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={strength}
+                    onChange={(e) => setStrength(Number(e.target.value))}
+                    className="mt-2 w-full accent-[#ff3bff]"
+                  />
+                  <div className="mt-1 text-[11px] text-[#C4B3D9]/80">
+                    Lower = preserves base image more. Higher = changes more.
+                  </div>
                 </div>
               </div>
             )}
 
-            {/* Actions */}
+            {/* Generate button */}
             <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <button
-                  className={primaryBtn}
-                  type="button"
-                  onClick={onGenerate}
-                  disabled={!canGenerate}
-                  title={mode === "video" ? "Video backend coming soon" : undefined}
-                >
-                  {isGenerating ? "Generating..." : mode === "video" ? "Generate Video" : "Generate"}
-                </button>
-
-                {active?.url ? (
-                  <a
-                    href={active.url}
-                    download={`naughtybotty-${active.character || "scene"}-${active.id}.png`}
-                    className={outlineBtn}
-                  >
-                    Download PNG
-                  </a>
-                ) : (
-                  <button className={outlineBtn} type="button" disabled>
-                    Download PNG
-                  </button>
+              <button
+                onClick={onGenerate}
+                disabled={!canGenerate}
+                className={clsx(
+                  "inline-flex h-11 items-center justify-center rounded-full px-6 text-sm font-semibold text-white transition",
+                  canGenerate
+                    ? "bg-gradient-to-r from-[#ff3bff] to-[#c56bfb] shadow-[0_0_30px_rgba(255,59,255,0.22)] hover:brightness-110 active:scale-[0.99]"
+                    : "bg-white/10 text-white/50"
                 )}
-              </div>
+              >
+                {isGenerating ? "Generating…" : mode === "video" ? "Generate Video" : mode === "remix" ? "Generate Remix" : "Generate"}
+              </button>
 
               <div className="text-xs text-[#C4B3D9]">
-                Character presets & deeper controls will expand here later.
+                Tip: keep the same seed for consistency.
               </div>
             </div>
 
-            {/* Preview */}
-            <div className="mt-7 rounded-3xl border border-[#c56bfb]/20 bg-black/25 p-4">
-              <div className="mb-3 flex items-center justify-between">
-                <div className="text-sm font-semibold text-[#F4ECFF]">Preview</div>
-                {active?.createdAt ? (
-                  <div className="text-xs text-[#C4B3D9]">
-                    {new Date(active.createdAt).toLocaleString()}
-                  </div>
-                ) : null}
+            {/* Active preview */}
+            {active?.url && (
+              <div className="mt-6 overflow-hidden rounded-3xl border border-[#c56bfb]/25 bg-black/20">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                {active.mode === "video" ? (
+                  <video controls className="h-full w-full">
+                    <source src={active.url} />
+                  </video>
+                ) : (
+                  <img src={active.url} alt="Generated" className="h-full w-full object-cover" />
+                )}
               </div>
+            )}
 
-              {active?.error ? (
-                <div className="rounded-2xl border border-[#ff3bff]/30 bg-[#ff3bff]/10 p-4 text-sm text-[#F4ECFF]">
-                  {active.error}
-                </div>
-              ) : active?.url ? (
-                <div className="overflow-hidden rounded-2xl border border-[#c56bfb]/25 bg-black/40">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={active.url} alt="Generated" className="h-auto w-full" />
-                </div>
-              ) : (
-                <div className="flex min-h-[220px] items-center justify-center rounded-2xl border border-dashed border-[#c56bfb]/25 bg-black/30 text-sm text-[#C4B3D9]">
-                  Generate to see your output here.
-                </div>
-              )}
-            </div>
+            {active?.error && (
+              <div className="mt-6 rounded-3xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-[#F4ECFF]">
+                {active.error}
+              </div>
+            )}
           </div>
 
-          {/* Right: controls + history */}
-          <div className="rounded-3xl border border-[#c56bfb]/30 bg-gradient-to-b from-[#0A0013] to-[#120021] p-6 shadow-[0_0_55px_rgba(255,59,255,0.08)]">
+          {/* RIGHT */}
+          <div className="rounded-3xl border border-[#c56bfb]/35 bg-white/5 p-6">
             <div className="text-sm font-semibold text-[#F4ECFF]">Controls</div>
 
             <div className="mt-4 grid gap-4">
-              <div className="grid gap-2">
-                <label className="text-xs font-semibold text-[#C4B3D9]">Character</label>
+              <div>
+                <div className="text-xs font-semibold text-[#C4B3D9]">Character</div>
                 <select
-                  className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
                   value={selectedCharacterId}
                   onChange={(e) => setSelectedCharacterId(e.target.value)}
+                  className="mt-2 h-11 w-full rounded-2xl border border-[#c56bfb]/30 bg-black/20 px-4 text-sm text-[#F4ECFF] outline-none focus:border-[#ff3bff]/60"
                 >
                   {characterOptions.map((c) => (
                     <option key={c.id} value={c.id}>
@@ -435,131 +575,87 @@ export default function StudioClient() {
                 </select>
               </div>
 
-              <div className="grid gap-2">
-                <label className="text-xs font-semibold text-[#C4B3D9]">Aspect</label>
-                <select
-                  className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                  value={aspect}
-                  onChange={(e) => setAspect(e.target.value)}
-                  disabled={mode === "video"} // optional: keep UI consistent for now
-                >
-                  <option value="4:5">4:5 (portrait)</option>
-                  <option value="16:9">16:9 (landscape)</option>
-                  <option value="1:1">1:1 (square)</option>
-                </select>
-                {mode === "video" ? (
-                  <div className="text-xs text-[#C4B3D9]">Video aspect will be wired later.</div>
-                ) : null}
-              </div>
-
-              {mode === "image" ? (
-                <>
-                  <div className="grid gap-2">
-                    <label className="text-xs font-semibold text-[#C4B3D9]">Steps</label>
-                    <input
-                      type="number"
-                      className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                      value={steps}
-                      onChange={(e) => setSteps(Number(e.target.value))}
-                      min={1}
-                      max={80}
-                    />
-                  </div>
-
-                  <div className="grid gap-2">
-                    <label className="text-xs font-semibold text-[#C4B3D9]">Guidance</label>
-                    <input
-                      type="number"
-                      className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                      value={guidance}
-                      onChange={(e) => setGuidance(Number(e.target.value))}
-                      min={0}
-                      max={30}
-                      step={0.5}
-                    />
-                  </div>
-
-                  <div className="grid gap-2">
-                    <label className="text-xs font-semibold text-[#C4B3D9]">Seed</label>
-                    <input
-                      type="number"
-                      className="h-11 w-full rounded-2xl border border-[#c56bfb]/25 bg-black/30 px-3 text-sm text-[#F4ECFF] outline-none"
-                      value={seed}
-                      onChange={(e) => setSeed(Number(e.target.value))}
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="rounded-2xl border border-[#c56bfb]/20 bg-white/5 p-4 text-sm text-[#C4B3D9]">
-                  Video controls will live here once the backend endpoint is live.
-                  <div className="mt-2 text-xs">
-                    Planned: frames, fps, motion strength, camera presets.
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className="mt-7 border-t border-white/10 pt-5">
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-semibold text-[#F4ECFF]">History</div>
-                <button
-                  type="button"
-                  className="text-xs text-[#C4B3D9] hover:text-[#F4ECFF]"
-                  onClick={() => {
-                    // revoke existing blob URLs
-                    for (const r of results) {
-                      if (r.url?.startsWith("blob:")) URL.revokeObjectURL(r.url);
-                    }
-                    setResults([]);
-                    setActive(null);
-                  }}
-                >
-                  Clear
-                </button>
-              </div>
-
-              <div className="mt-4 grid gap-3">
-                {results.length === 0 ? (
-                  <div className="rounded-2xl border border-[#c56bfb]/20 bg-black/25 p-4 text-sm text-[#C4B3D9]">
-                    Your latest generations will appear here.
-                  </div>
-                ) : (
-                  results.slice(0, 8).map((r) => (
+              <div>
+                <div className="text-xs font-semibold text-[#C4B3D9]">Aspect</div>
+                <div className="mt-2 flex gap-2">
+                  {["4:5", "1:1", "16:9"].map((a) => (
                     <button
-                      key={r.id}
-                      type="button"
-                      onClick={() => setActive(r)}
+                      key={a}
+                      onClick={() => setAspect(a)}
                       className={clsx(
-                        "flex items-start gap-3 rounded-2xl border bg-black/25 p-3 text-left transition hover:brightness-110",
-                        active?.id === r.id ? "border-[#ff3bff]/50" : "border-[#c56bfb]/20"
+                        "h-9 flex-1 rounded-full px-3 text-sm font-semibold transition",
+                        aspect === a
+                          ? "bg-white/10 text-[#F4ECFF] ring-1 ring-[#ff3bff]/35"
+                          : "border border-[#c56bfb]/30 bg-black/10 text-[#C4B3D9] hover:bg-white/5"
                       )}
                     >
-                      <div className="h-14 w-14 overflow-hidden rounded-xl border border-[#c56bfb]/20 bg-black/30">
-                        {r.url ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img src={r.url} alt="" className="h-full w-full object-cover" />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center text-[10px] text-[#C4B3D9]">
-                            {r.mode.toUpperCase()}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="truncate text-sm font-semibold text-[#F4ECFF]">
-                            {r.character ? r.character.toUpperCase() : "SCENE"}
-                          </div>
-                          <div className="text-[10px] text-[#C4B3D9]">{r.aspect || ""}</div>
-                        </div>
-                        <div className="mt-1 line-clamp-2 text-xs text-[#C4B3D9]">{r.prompt}</div>
-                        {r.error ? (
-                          <div className="mt-1 text-xs text-[#ff7bd6]">{r.error}</div>
-                        ) : null}
-                      </div>
+                      {a}
                     </button>
-                  ))
-                )}
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-[#C4B3D9]">Steps</div>
+                  <input
+                    type="number"
+                    value={steps}
+                    min={1}
+                    max={80}
+                    onChange={(e) => setSteps(Number(e.target.value))}
+                    className="mt-2 h-11 w-full rounded-2xl border border-[#c56bfb]/30 bg-black/20 px-4 text-sm text-[#F4ECFF] outline-none focus:border-[#ff3bff]/60"
+                  />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-[#C4B3D9]">Guidance</div>
+                  <input
+                    type="number"
+                    value={guidance}
+                    step={0.1}
+                    min={0}
+                    max={30}
+                    onChange={(e) => setGuidance(Number(e.target.value))}
+                    className="mt-2 h-11 w-full rounded-2xl border border-[#c56bfb]/30 bg-black/20 px-4 text-sm text-[#F4ECFF] outline-none focus:border-[#ff3bff]/60"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <div className="text-xs font-semibold text-[#C4B3D9]">Seed</div>
+                <input
+                  type="number"
+                  value={seed}
+                  onChange={(e) => setSeed(Number(e.target.value))}
+                  className="mt-2 h-11 w-full rounded-2xl border border-[#c56bfb]/30 bg-black/20 px-4 text-sm text-[#F4ECFF] outline-none focus:border-[#ff3bff]/60"
+                />
+              </div>
+
+              <div className="rounded-2xl border border-[#c56bfb]/25 bg-black/10 p-4">
+                <div className="text-xs font-semibold text-[#F4ECFF]">History</div>
+                <div className="mt-3 space-y-3">
+                  {results.slice(0, 6).map((r) => (
+                    <button
+                      key={r.id}
+                      onClick={() => setActive(r)}
+                      className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left text-xs text-[#C4B3D9] hover:bg-white/10"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-[#F4ECFF]">
+                          {r.mode.toUpperCase()} • {r.character || "—"}
+                        </span>
+                        <span className="text-[10px] text-[#C4B3D9]/80">
+                          {r.createdAt ? new Date(r.createdAt).toLocaleString() : ""}
+                        </span>
+                      </div>
+                      <div className="mt-1 line-clamp-2">{r.prompt}</div>
+                      {r.error && <div className="mt-1 text-red-300">{r.error}</div>}
+                    </button>
+                  ))}
+                  {results.length === 0 && (
+                    <div className="text-xs text-[#C4B3D9]">No generations yet.</div>
+                  )}
+                </div>
               </div>
             </div>
           </div>
